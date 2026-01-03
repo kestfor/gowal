@@ -1,4 +1,4 @@
-module github.com/vadiminshakov/gowal
+module github.com/kestfor/gowal
 
 go 1.23.0
 
