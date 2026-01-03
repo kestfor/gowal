@@ -1,20 +1,19 @@
 package gowal
 
 import (
-	"bytes"
-	"encoding/gob"
 	"iter"
 	"os"
 	"path"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pkg/errors"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 var ErrExists = errors.New("msg with such index already exists")
+var ErrShutdown = errors.New("wal is shutting down")
 
 // Wal is a write-ahead log that stores key-value pairs.
 //
@@ -32,12 +31,6 @@ type Wal struct {
 	// index that matches height of msg record with offset in file
 	index    map[uint64]msg
 	tmpIndex map[uint64]msg
-
-	// gob encoder for proposed messages
-	enc *gob.Encoder
-
-	// buffer for proposed messages
-	buf *bytes.Buffer
 
 	// path to directory with logs
 	pathToLogsDir string
@@ -61,6 +54,12 @@ type Wal struct {
 	maxSegments int
 
 	isInSyncDiskMode bool
+
+	// Batch writing fields
+	writeCh    chan *writeRequest
+	shutdownCh chan struct{}
+	workerDone sync.WaitGroup
+	batchCfg   batchConfig
 }
 
 // Config represents the configuration for the WAL (Write-Ahead Log).
@@ -79,12 +78,39 @@ type Config struct {
 
 	// IsInSyncDiskMode indicates whether the log should be synced to disk after each write.
 	IsInSyncDiskMode bool
+
+	// MaxBatchSize is the maximum number of write requests per batch.
+	// Default: 100
+	MaxBatchSize int
+
+	// MaxBatchDelay is the maximum time to wait for accumulating a batch.
+	// Default: 10ms
+	MaxBatchDelay time.Duration
+
+	// WriteChannelSize is the size of the buffered channel for write requests.
+	// Default: 1000
+	WriteChannelSize int
+
+	// BatchSync indicates whether to fsync after each batch write.
+	// Default: false
+	BatchSync bool
 }
 
 // NewWAL creates a new WAL with the given configuration.
 func NewWAL(config Config) (*Wal, error) {
 	if err := os.MkdirAll(config.Dir, 0755); err != nil {
 		return nil, errors.Wrap(err, "failed to create log directory")
+	}
+
+	// Apply defaults for batch configuration
+	if config.MaxBatchSize == 0 {
+		config.MaxBatchSize = 100
+	}
+	if config.MaxBatchDelay == 0 {
+		config.MaxBatchDelay = 10 * time.Millisecond
+	}
+	if config.WriteChannelSize == 0 {
+		config.WriteChannelSize = 1000
 	}
 
 	segmentsNumbers, err := findSegmentNumber(config.Dir, config.Prefix)
@@ -102,13 +128,26 @@ func NewWAL(config Config) (*Wal, error) {
 		numberOfSegments = 1
 	}
 
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-
-	w := &Wal{log: fd, index: index, tmpIndex: make(map[uint64]msg),
-		buf: &buf, enc: enc, lastOffset: lastOffset, pathToLogsDir: config.Dir,
-		segmentsNumber: numberOfSegments, prefix: config.Prefix, segmentsThreshold: config.SegmentThreshold,
-		maxSegments: config.MaxSegments, isInSyncDiskMode: config.IsInSyncDiskMode}
+	w := &Wal{
+		log:               fd,
+		index:             index,
+		tmpIndex:          make(map[uint64]msg),
+		lastOffset:        lastOffset,
+		pathToLogsDir:     config.Dir,
+		segmentsNumber:    numberOfSegments,
+		prefix:            config.Prefix,
+		segmentsThreshold: config.SegmentThreshold,
+		maxSegments:       config.MaxSegments,
+		isInSyncDiskMode:  config.IsInSyncDiskMode,
+		writeCh:           make(chan *writeRequest, config.WriteChannelSize),
+		shutdownCh:        make(chan struct{}),
+		batchCfg: batchConfig{
+			maxBatchSize:  config.MaxBatchSize,
+			maxBatchDelay: config.MaxBatchDelay,
+			channelSize:   config.WriteChannelSize,
+			batchSync:     config.BatchSync,
+		},
+	}
 
 	lastIndex := uint64(0)
 	for v := range w.Iterator() {
@@ -118,6 +157,10 @@ func NewWAL(config Config) (*Wal, error) {
 	}
 
 	w.lastIndex.Store(lastIndex)
+
+	// Start write worker goroutine
+	w.workerDone.Add(1)
+	go w.writeWorker()
 
 	return w, nil
 }
@@ -169,50 +212,47 @@ func (c *Wal) CurrentIndex() uint64 {
 
 // Write writes key-value pair to the log.
 func (c *Wal) Write(index uint64, key string, value []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	return c.WriteWithSync(index, key, value, false)
+}
 
-	if _, exists := c.index[index]; exists {
-		return ErrExists
+// WriteWithSync writes key-value pair to the log with optional fsync.
+// If sync is true, the write will be fsynced to disk before returning.
+func (c *Wal) WriteWithSync(index uint64, key string, value []byte, sync bool) error {
+	// Check shutdown first
+	select {
+	case <-c.shutdownCh:
+		return ErrShutdown
+	default:
 	}
 
-	if err := c.rotateIfNeeded(); err != nil {
-		return err
+	// Create request
+	req := &writeRequest{
+		index:       index,
+		key:         key,
+		value:       value,
+		sync:        sync,
+		isTombstone: false,
+		respCh:      make(chan writeResponse, 1),
 	}
 
-	m := msg{Key: key, Value: value, Idx: index}
-	m.Checksum = m.calculateChecksum()
-
-	data, err := msgpack.Marshal(m)
-	if err != nil {
-		return errors.Wrap(err, "failed to encode msg")
+	// Submit to worker
+	select {
+	case c.writeCh <- req:
+	case <-c.shutdownCh:
+		return ErrShutdown
 	}
 
-	if _, err := c.log.Write(data); err != nil {
-		return errors.Wrap(err, "failed to write msg to log")
-	}
-
-	if c.isInSyncDiskMode {
-		if err := c.log.Sync(); err != nil {
-			return errors.Wrap(err, "failed to sync log")
-		}
-	}
-
-	c.lastOffset += int64(len(data))
-	c.lastIndex.Add(1)
-	c.tmpIndex[index] = m
-
-	return nil
+	// Wait for response
+	resp := <-req.respCh
+	return resp.err
 }
 
 // WriteTombstone writes a tombstone record for the given index.
 // If no record exists for the index, returns nil (no-op).
 // If a record exists, overwrites it with a tombstone.
 func (c *Wal) WriteTombstone(index uint64) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// check if record exists in main index or temp index
+	// Check if record exists
+	c.mu.RLock()
 	var existingMsg msg
 	var exists bool
 
@@ -223,42 +263,33 @@ func (c *Wal) WriteTombstone(index uint64) error {
 		existingMsg = msg
 		exists = true
 	}
+	c.mu.RUnlock()
 
-	// if no record exists, return nil (no-op)
+	// If no record exists, return nil (no-op)
 	if !exists {
 		return nil
 	}
 
-	if err := c.rotateIfNeeded(); err != nil {
-		return err
+	// Create tombstone request (with isTombstone flag to allow overwrite)
+	req := &writeRequest{
+		index:       index,
+		key:         existingMsg.Key,
+		value:       []byte("tombstone"),
+		sync:        false,
+		isTombstone: true,
+		respCh:      make(chan writeResponse, 1),
 	}
 
-	// create tombstone with existing key
-	tombstone := msg{Key: existingMsg.Key, Value: []byte("tombstone"), Idx: index}
-	tombstone.Checksum = tombstone.calculateChecksum()
-
-	data, err := msgpack.Marshal(tombstone)
-	if err != nil {
-		return errors.Wrap(err, "failed to encode tombstone")
+	// Submit to worker
+	select {
+	case c.writeCh <- req:
+	case <-c.shutdownCh:
+		return ErrShutdown
 	}
 
-	if _, err := c.log.Write(data); err != nil {
-		return errors.Wrap(err, "failed to write tombstone to log")
-	}
-
-	if c.isInSyncDiskMode {
-		if err := c.log.Sync(); err != nil {
-			return errors.Wrap(err, "failed to sync log")
-		}
-	}
-
-	c.lastOffset += int64(len(data))
-	c.tmpIndex[index] = tombstone
-
-	// remove from main index if it exists there to avoid confusion
-	delete(c.index, index)
-
-	return nil
+	// Wait for response
+	resp := <-req.respCh
+	return resp.err
 }
 
 // Iterator returns push-based iterator for the WAL messages.
@@ -325,6 +356,13 @@ func (c *Wal) PullIterator() (next func() (msg, bool), stop func()) {
 
 // Close closes log file.
 func (c *Wal) Close() error {
+	// Signal shutdown to worker
+	close(c.shutdownCh)
+
+	// Wait for worker to drain pending writes and exit
+	c.workerDone.Wait()
+
+	// Now safe to close the file
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
