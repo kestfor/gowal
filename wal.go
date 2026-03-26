@@ -199,6 +199,7 @@ func (c *Wal) WriteBatch(batch []Record) error {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	currentLastIndex := c.lastIndex.Load()
 
 	for _, record := range batch {
 		if _, exists := c.index[record.Index]; exists {
@@ -213,6 +214,12 @@ func (c *Wal) WriteBatch(batch []Record) error {
 	messages := make([]msg, 0, c.segmentsThreshold)
 	c.buf.Grow(len(batch) * 128) // small heuristic; avoids repeated growth on small/medium batches
 	nextRotateAfter := c.segmentsThreshold - len(c.tmpIndex)
+	if nextRotateAfter <= 0 {
+		if err := c.rotateIfNeeded(); err != nil {
+			return err
+		}
+		nextRotateAfter = c.segmentsThreshold
+	}
 
 	flush := func() error {
 		if c.buf.Len() == 0 {
@@ -230,10 +237,12 @@ func (c *Wal) WriteBatch(batch []Record) error {
 
 		for _, m := range messages {
 			c.tmpIndex[m.Idx] = m
+			if m.Idx > currentLastIndex {
+				currentLastIndex = m.Idx
+			}
 		}
 
 		c.lastOffset += int64(c.buf.Len())
-		c.lastIndex.Add(uint64(len(messages)))
 
 		c.buf.Reset()
 		messages = messages[:0]
@@ -265,6 +274,7 @@ func (c *Wal) WriteBatch(batch []Record) error {
 	if err := flush(); err != nil {
 		return err
 	}
+	c.lastIndex.Store(currentLastIndex)
 	return nil
 }
 
